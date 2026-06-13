@@ -1,6 +1,6 @@
 # Inspire Hand MediaPipe Teleoperation
 
-<video src="media/inspire_hand_mediapipe_teleoperation.mp4" width="720" controls muted></video>
+https://github.com/user-attachments/assets/5be19f2d-1b30-4d01-a258-13e95e5e884a
 
 This package provides a ROS 2 teleoperation layer for Unitree G1 Inspire RH56DFX hands.
 Simulation uses RViz plus `ros2_control` mock hardware with the same controller action names as the real G1 hand controllers.
