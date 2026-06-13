@@ -1,0 +1,17 @@
+name: Industrial CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build_and_test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ros-industrial/industrial_ci@master
+        env:
+          ROS_DISTRO: jazzy
+          UPSTREAM_WORKSPACE: .github/upstream.jazzy.repos

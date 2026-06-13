@@ -1,0 +1,5 @@
+repositories:
+  PME26Elvis/mediapipe_ros2_suite:
+    type: git
+    url: https://github.com/PME26Elvis/mediapipe_ros2_suite.git
+    version: main

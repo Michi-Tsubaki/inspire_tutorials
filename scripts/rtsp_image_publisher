@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Publish an RTSP camera stream as sensor_msgs/Image."""
+
+from __future__ import annotations
+
+import os
+import threading
+import time
+from typing import Optional
+
+import cv2
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Image
+
+
+DEFAULT_STREAM_URL = "rtsp://172.188.66.116:8554/camera"
+
+
+class RtspImagePublisher(Node):
+    """Bridge an OpenCV-readable video stream to a ROS 2 image topic."""
+
+    def __init__(self) -> None:
+        super().__init__("rtsp_image_publisher")
+
+        self.declare_parameter("stream_url", DEFAULT_STREAM_URL)
+        self.declare_parameter("image_topic", "/image_raw")
+        self.declare_parameter("frame_id", "camera")
+        self.declare_parameter("publish_rate_hz", 30.0)
+        self.declare_parameter("reconnect_delay_sec", 2.0)
+        self.declare_parameter("rtsp_transport", "tcp")
+        self.declare_parameter("open_timeout_sec", 5.0)
+        self.declare_parameter("read_timeout_sec", 5.0)
+        self.declare_parameter("buffer_size", 1)
+
+        self.stream_url = str(self.get_parameter("stream_url").value).strip()
+        self.image_topic = str(self.get_parameter("image_topic").value).strip()
+        self.frame_id = str(self.get_parameter("frame_id").value).strip()
+        self.publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
+        self.reconnect_delay_sec = max(
+            0.1,
+            float(self.get_parameter("reconnect_delay_sec").value),
+        )
+        self.open_timeout_sec = max(
+            0.1,
+            float(self.get_parameter("open_timeout_sec").value),
+        )
+        self.read_timeout_sec = max(
+            0.1,
+            float(self.get_parameter("read_timeout_sec").value),
+        )
+        self.buffer_size = max(1, int(self.get_parameter("buffer_size").value))
+
+        if not self.stream_url:
+            raise ValueError("stream_url must not be empty")
+        if not self.image_topic:
+            raise ValueError("image_topic must not be empty")
+        if not self.frame_id:
+            raise ValueError("frame_id must not be empty")
+
+        self._configure_ffmpeg_options()
+
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
+        self.publisher = self.create_publisher(Image, self.image_topic, qos)
+
+        self._stop_event = threading.Event()
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop,
+            name="rtsp_capture",
+            daemon=True,
+        )
+        self._capture_thread.start()
+
+        self.get_logger().info(
+            "RTSP image publisher started: %s -> %s"
+            % (self.stream_url, self.image_topic)
+        )
+
+    def _configure_ffmpeg_options(self) -> None:
+        transport = str(self.get_parameter("rtsp_transport").value).strip().lower()
+        if transport not in ("tcp", "udp", ""):
+            raise ValueError("rtsp_transport must be 'tcp', 'udp', or empty")
+        if not transport:
+            return
+
+        options = "rtsp_transport;%s" % transport
+        existing = os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS")
+        if existing:
+            options = "%s|%s" % (existing, options)
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = options
+
+    def _open_capture(self) -> cv2.VideoCapture:
+        params = []
+        open_timeout = getattr(cv2, "CAP_PROP_OPEN_TIMEOUT_MSEC", None)
+        read_timeout = getattr(cv2, "CAP_PROP_READ_TIMEOUT_MSEC", None)
+        if open_timeout is not None:
+            params.extend([open_timeout, int(self.open_timeout_sec * 1000)])
+        if read_timeout is not None:
+            params.extend([read_timeout, int(self.read_timeout_sec * 1000)])
+
+        try:
+            if params:
+                capture = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG, params)
+            else:
+                capture = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
+        except TypeError:
+            capture = cv2.VideoCapture(self.stream_url, cv2.CAP_FFMPEG)
+
+        buffer_size = getattr(cv2, "CAP_PROP_BUFFERSIZE", None)
+        if buffer_size is not None:
+            capture.set(buffer_size, self.buffer_size)
+        return capture
+
+    def _capture_loop(self) -> None:
+        publish_period_sec: Optional[float]
+        if self.publish_rate_hz > 0.0:
+            publish_period_sec = 1.0 / self.publish_rate_hz
+        else:
+            publish_period_sec = None
+
+        last_publish_time = 0.0
+        while not self._stop_event.is_set():
+            capture = self._open_capture()
+            if not capture.isOpened():
+                self.get_logger().warn(
+                    "failed to open stream: %s" % self.stream_url
+                )
+                capture.release()
+                self._sleep_before_reconnect()
+                continue
+
+            self.get_logger().info("connected to stream: %s" % self.stream_url)
+            frame_count = 0
+            try:
+                while not self._stop_event.is_set():
+                    ok, frame = capture.read()
+                    if not ok or frame is None:
+                        self.get_logger().warn("stream read failed; reconnecting")
+                        break
+
+                    now = time.monotonic()
+                    if (
+                        publish_period_sec is not None
+                        and now - last_publish_time < publish_period_sec
+                    ):
+                        continue
+
+                    msg = self._frame_to_msg(frame)
+                    self.publisher.publish(msg)
+                    last_publish_time = now
+                    frame_count += 1
+
+                    if frame_count == 1:
+                        self.get_logger().info(
+                            "publishing %dx%d %s frames on %s"
+                            % (
+                                msg.width,
+                                msg.height,
+                                msg.encoding,
+                                self.image_topic,
+                            )
+                        )
+            finally:
+                capture.release()
+
+            self._sleep_before_reconnect()
+
+    def _sleep_before_reconnect(self) -> None:
+        if not self._stop_event.is_set():
+            self._stop_event.wait(self.reconnect_delay_sec)
+
+    def _frame_to_msg(self, frame) -> Image:
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = frame.copy()
+
+        msg = Image()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.frame_id
+        msg.height = frame.shape[0]
+        msg.width = frame.shape[1]
+        msg.is_bigendian = 0
+
+        if len(frame.shape) == 2:
+            msg.encoding = "mono8"
+            msg.step = msg.width
+        else:
+            channels = frame.shape[2]
+            if channels == 3:
+                msg.encoding = "bgr8"
+            elif channels == 4:
+                msg.encoding = "bgra8"
+            else:
+                raise ValueError("unsupported image channel count: %d" % channels)
+            msg.step = msg.width * channels
+
+        msg.data = frame.tobytes()
+        return msg
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._capture_thread.join(timeout=2.0)
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = None
+    try:
+        node = RtspImagePublisher()
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        if node is not None:
+            node.stop()
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()

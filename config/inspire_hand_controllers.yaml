@@ -1,0 +1,44 @@
+controller_manager:
+  ros__parameters:
+    update_rate: 100
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    right_hand_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+    left_hand_controller:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+right_hand_controller:
+  ros__parameters:
+    joints:
+      - R_thumb_proximal_yaw_joint
+      - R_thumb_proximal_pitch_joint
+      - R_index_proximal_joint
+      - R_middle_proximal_joint
+      - R_ring_proximal_joint
+      - R_pinky_proximal_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    interpolate_from_desired_state: true
+
+left_hand_controller:
+  ros__parameters:
+    joints:
+      - L_thumb_proximal_yaw_joint
+      - L_thumb_proximal_pitch_joint
+      - L_index_proximal_joint
+      - L_middle_proximal_joint
+      - L_ring_proximal_joint
+      - L_pinky_proximal_joint
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    interpolate_from_desired_state: true

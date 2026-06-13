@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""Teleoperate Inspire RH56DFX hands from MediaPipe hand landmarks."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+from control_msgs.action import FollowJointTrajectory
+from mediapipe_ros2_interfaces.msg import HandLandmarks
+import rclpy
+from rclpy.action import ActionClient
+from rclpy.node import Node
+from sensor_msgs.msg import JointState
+
+from inspire_tutorials.hand_mapping import (
+    joint_names_for_side,
+    landmarks_to_positions,
+    normalize_hand_selection,
+    normalize_handedness,
+    smooth_positions,
+)
+from inspire_tutorials.trajectory import make_follow_joint_trajectory_goal
+
+
+@dataclass
+class CandidateHand:
+    """Detected MediaPipe hand candidate."""
+
+    side: str
+    score: float
+    landmarks: object
+
+
+class InspireHandTeleop(Node):
+    """Bridge MediaPipe hand landmarks to Inspire hand trajectory actions."""
+
+    def __init__(self) -> None:
+        super().__init__("inspire_hand_teleop")
+
+        self.declare_parameter("hand", "both")
+        self.declare_parameter("landmarks_topic", "/mediapipe/hand/landmarks")
+        self.declare_parameter("target_joint_states_topic", "/inspire_hand/target_joint_states")
+        self.declare_parameter(
+            "right_action_name",
+            "/right_hand_controller/follow_joint_trajectory",
+        )
+        self.declare_parameter(
+            "left_action_name",
+            "/left_hand_controller/follow_joint_trajectory",
+        )
+        self.declare_parameter("server_timeout_sec", 1.0)
+        self.declare_parameter("allow_missing_controllers", True)
+        self.declare_parameter("move_duration_sec", 0.15)
+        self.declare_parameter("command_rate_hz", 12.0)
+        self.declare_parameter("smoothing_alpha", 0.65)
+        self.declare_parameter("hand_score_threshold", 0.35)
+        self.declare_parameter("mirror_handedness", False)
+
+        self.sides = normalize_hand_selection(self.get_parameter("hand").value)
+        self.move_duration_sec = float(self.get_parameter("move_duration_sec").value)
+        command_rate_hz = float(self.get_parameter("command_rate_hz").value)
+        self.min_command_period_sec = 1.0 / max(command_rate_hz, 1e-6)
+        self.smoothing_alpha = float(self.get_parameter("smoothing_alpha").value)
+        self.hand_score_threshold = float(
+            self.get_parameter("hand_score_threshold").value
+        )
+        self.mirror_handedness = bool(self.get_parameter("mirror_handedness").value)
+        self.allow_missing_controllers = bool(
+            self.get_parameter("allow_missing_controllers").value
+        )
+
+        self.action_names = {
+            "right": str(self.get_parameter("right_action_name").value),
+            "left": str(self.get_parameter("left_action_name").value),
+        }
+        self.action_clients: Dict[str, ActionClient] = {
+            side: ActionClient(self, FollowJointTrajectory, self.action_names[side])
+            for side in self.sides
+        }
+        self.available = {side: False for side in self.sides}
+        self.goal_pending = {side: False for side in self.sides}
+        self.last_positions: Dict[str, Optional[List[float]]] = {
+            side: None for side in self.sides
+        }
+        self.last_send_time_ns = {side: 0 for side in self.sides}
+
+        self.wait_for_initial_servers()
+
+        landmarks_topic = str(self.get_parameter("landmarks_topic").value)
+        self.sub = self.create_subscription(
+            HandLandmarks,
+            landmarks_topic,
+            self.on_landmarks,
+            10,
+        )
+        self.target_pub = self.create_publisher(
+            JointState,
+            str(self.get_parameter("target_joint_states_topic").value),
+            10,
+        )
+        self.reconnect_timer = self.create_timer(1.0, self.refresh_action_servers)
+
+        self.get_logger().info(
+            "Inspire hand teleop started: hand=%s, landmarks=%s"
+            % (",".join(self.sides), landmarks_topic)
+        )
+
+    def wait_for_initial_servers(self) -> None:
+        timeout = float(self.get_parameter("server_timeout_sec").value)
+        missing = []
+        for side, client in self.action_clients.items():
+            self.available[side] = client.wait_for_server(timeout_sec=timeout)
+            if not self.available[side]:
+                missing.append(side)
+
+        if missing and not self.allow_missing_controllers:
+            raise RuntimeError(
+                "missing hand action server(s): "
+                + ", ".join(f"{side}={self.action_names[side]}" for side in missing)
+            )
+        for side in missing:
+            self.get_logger().warn(
+                "%s hand action server is not available yet: %s"
+                % (side, self.action_names[side])
+            )
+
+    def refresh_action_servers(self) -> None:
+        for side, client in self.action_clients.items():
+            ready = client.server_is_ready()
+            if ready and not self.available[side]:
+                self.get_logger().info(
+                    "%s hand action server is now available: %s"
+                    % (side, self.action_names[side])
+                )
+            self.available[side] = ready
+
+    def on_landmarks(self, msg: HandLandmarks) -> None:
+        candidates = self.make_candidates(msg)
+        if not candidates:
+            return
+
+        joint_state = JointState()
+        joint_state.header.stamp = self.get_clock().now().to_msg()
+        joint_state.header.frame_id = msg.header.frame_id
+
+        for side in self.sides:
+            selected = self.select_candidate_for_side(side, candidates)
+            if selected is None:
+                continue
+            try:
+                raw_positions = landmarks_to_positions(selected.landmarks)
+            except ValueError as exc:
+                self.get_logger().warn(str(exc))
+                continue
+
+            positions = smooth_positions(
+                self.last_positions[side],
+                raw_positions,
+                self.smoothing_alpha,
+            )
+            self.last_positions[side] = positions
+
+            joint_state.name.extend(joint_names_for_side(side))
+            joint_state.position.extend(positions)
+            self.send_positions(side, positions)
+
+        if joint_state.name:
+            self.target_pub.publish(joint_state)
+
+    def make_candidates(self, msg: HandLandmarks) -> List[CandidateHand]:
+        candidates = []
+        for hand in msg.hands:
+            if float(hand.score) < self.hand_score_threshold:
+                continue
+            candidates.append(
+                CandidateHand(
+                    side=normalize_handedness(
+                        hand.handedness,
+                        mirror_handedness=self.mirror_handedness,
+                    ),
+                    score=float(hand.score),
+                    landmarks=hand.landmarks,
+                )
+            )
+        return candidates
+
+    def select_candidate_for_side(
+        self,
+        side: str,
+        candidates: List[CandidateHand],
+    ) -> Optional[CandidateHand]:
+        matching = [candidate for candidate in candidates if candidate.side == side]
+        if matching:
+            return max(matching, key=lambda candidate: candidate.score)
+
+        if len(self.sides) == 1:
+            return max(candidates, key=lambda candidate: candidate.score)
+        return None
+
+    def send_positions(self, side: str, positions: List[float]) -> None:
+        if not self.available.get(side, False):
+            return
+        if self.goal_pending.get(side, False):
+            return
+
+        now_ns = self.get_clock().now().nanoseconds
+        elapsed_sec = (now_ns - self.last_send_time_ns[side]) / 1e9
+        if elapsed_sec < self.min_command_period_sec:
+            return
+
+        goal = make_follow_joint_trajectory_goal(
+            joint_names_for_side(side),
+            positions,
+            self.move_duration_sec,
+        )
+        self.goal_pending[side] = True
+        self.last_send_time_ns[side] = now_ns
+        future = self.action_clients[side].send_goal_async(goal)
+        future.add_done_callback(
+            lambda done, side=side: self.on_goal_response(side, done)
+        )
+
+    def on_goal_response(self, side: str, future) -> None:
+        try:
+            goal_handle = future.result()
+        except Exception as exc:  # noqa: BLE001
+            self.goal_pending[side] = False
+            self.available[side] = False
+            self.get_logger().warn("%s hand goal send failed: %s" % (side, exc))
+            return
+
+        if not goal_handle.accepted:
+            self.goal_pending[side] = False
+            self.get_logger().warn("%s hand goal was rejected" % side)
+            return
+
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(
+            lambda done, side=side: self.on_goal_result(side, done)
+        )
+
+    def on_goal_result(self, side: str, future) -> None:
+        self.goal_pending[side] = False
+        try:
+            result = future.result().result
+        except Exception as exc:  # noqa: BLE001
+            self.available[side] = False
+            self.get_logger().warn("%s hand goal result failed: %s" % (side, exc))
+            return
+
+        if result.error_code != FollowJointTrajectory.Result.SUCCESSFUL:
+            self.get_logger().warn(
+                "%s hand goal failed: error_code=%d, error_string=%s"
+                % (side, result.error_code, result.error_string)
+            )
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = None
+    try:
+        node = InspireHandTeleop()
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if node is not None:
+            try:
+                node.destroy_node()
+            except KeyboardInterrupt:
+                pass
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except KeyboardInterrupt:
+                pass
+
+
+if __name__ == "__main__":
+    main()

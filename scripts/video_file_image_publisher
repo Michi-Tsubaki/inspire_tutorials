@@ -1,0 +1,157 @@
+#!/usr/bin/env python3
+"""Publish a local video file as sensor_msgs/Image at video-timed playback."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import cv2
+import rclpy
+from rclpy.executors import ExternalShutdownException
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import Image
+
+
+class VideoFileImagePublisher(Node):
+    """Bridge a local video file to a ROS 2 image topic."""
+
+    def __init__(self) -> None:
+        super().__init__("video_file_image_publisher")
+
+        self.declare_parameter("video_file", "")
+        self.declare_parameter("image_topic", "/image_raw")
+        self.declare_parameter("frame_id", "camera")
+        self.declare_parameter("playback_speed", 0.5)
+        self.declare_parameter("loop", True)
+
+        self.video_file = Path(
+            str(self.get_parameter("video_file").value)
+        ).expanduser()
+        self.image_topic = str(self.get_parameter("image_topic").value).strip()
+        self.frame_id = str(self.get_parameter("frame_id").value).strip()
+        self.playback_speed = float(self.get_parameter("playback_speed").value)
+        self.loop = bool(self.get_parameter("loop").value)
+
+        if not self.video_file:
+            raise ValueError("video_file must not be empty")
+        if not self.video_file.is_file():
+            raise FileNotFoundError(str(self.video_file))
+        if not self.image_topic:
+            raise ValueError("image_topic must not be empty")
+        if not self.frame_id:
+            raise ValueError("frame_id must not be empty")
+        if self.playback_speed <= 0.0:
+            raise ValueError("playback_speed must be positive")
+
+        qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5,
+        )
+        self.publisher = self.create_publisher(Image, self.image_topic, qos)
+
+        self.capture = cv2.VideoCapture(str(self.video_file), cv2.CAP_FFMPEG)
+        if not self.capture.isOpened():
+            self.capture.release()
+            raise RuntimeError("failed to open video_file: %s" % self.video_file)
+
+        source_fps = float(self.capture.get(cv2.CAP_PROP_FPS) or 0.0)
+        if source_fps <= 0.0:
+            source_fps = 30.0
+        self.publish_rate_hz = source_fps * self.playback_speed
+        self.frame_count = int(self.capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.published_frames = 0
+        self.completed_loops = 0
+
+        self.timer = self.create_timer(1.0 / self.publish_rate_hz, self._tick)
+        self.get_logger().info(
+            "publishing %s to %s at %.3f Hz (%.3fx, loop=%s)"
+            % (
+                self.video_file,
+                self.image_topic,
+                self.publish_rate_hz,
+                self.playback_speed,
+                self.loop,
+            )
+        )
+
+    def _tick(self) -> None:
+        ok, frame = self.capture.read()
+        if not ok or frame is None:
+            if not self.loop:
+                self.get_logger().info("video ended; stopping playback")
+                self.timer.cancel()
+                return
+
+            self.completed_loops += 1
+            self.get_logger().info(
+                "restarting video playback loop %d" % self.completed_loops
+            )
+            self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = self.capture.read()
+            if not ok or frame is None:
+                self.get_logger().error("failed to restart video playback")
+                self.timer.cancel()
+                return
+
+        msg = self._frame_to_msg(frame)
+        self.publisher.publish(msg)
+        self.published_frames += 1
+
+        if self.published_frames == 1:
+            self.get_logger().info(
+                "publishing %dx%d %s frames on %s"
+                % (msg.width, msg.height, msg.encoding, self.image_topic)
+            )
+
+    def _frame_to_msg(self, frame) -> Image:
+        if not frame.flags["C_CONTIGUOUS"]:
+            frame = frame.copy()
+
+        msg = Image()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.frame_id
+        msg.height = frame.shape[0]
+        msg.width = frame.shape[1]
+        msg.is_bigendian = 0
+
+        if len(frame.shape) == 2:
+            msg.encoding = "mono8"
+            msg.step = msg.width
+        else:
+            channels = frame.shape[2]
+            if channels == 3:
+                msg.encoding = "bgr8"
+            elif channels == 4:
+                msg.encoding = "bgra8"
+            else:
+                raise ValueError("unsupported image channel count: %d" % channels)
+            msg.step = msg.width * channels
+
+        msg.data = frame.tobytes()
+        return msg
+
+    def destroy_node(self) -> bool:
+        if hasattr(self, "capture"):
+            self.capture.release()
+        return super().destroy_node()
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = None
+    try:
+        node = VideoFileImagePublisher()
+        rclpy.spin(node)
+    except (KeyboardInterrupt, ExternalShutdownException):
+        pass
+    finally:
+        if node is not None:
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
