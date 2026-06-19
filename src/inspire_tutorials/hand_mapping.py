@@ -29,10 +29,8 @@ LEFT_JOINTS = (
 
 OPEN_POSITIONS = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
 
-# Same safe closed posture as g1_bringup's Inspire DFX open/close demo.  The
-# hardware interface can close thumb yaw further, but this avoids thumb-index
-# interference while still making an obvious fist in RViz and on hardware.
-CLOSED_POSITIONS = (0.3, 0.6, 1.7, 1.7, 1.7, 1.7)
+# Closed posture used by the hand mapping helper, in radians.
+CLOSED_POSITIONS = (0.0, 0.6, 1.7, 1.7, 1.7, 1.7)
 
 FINGER_LANDMARKS: Mapping[str, Tuple[int, int, int, int]] = {
     "thumb": (1, 2, 3, 4),
