@@ -38,6 +38,7 @@ def test_launch_files_expose_same_actions_topics_and_hand_selection():
 def test_install_contract_includes_runtime_assets_and_scripts():
     cmake = (ROOT / "CMakeLists.txt").read_text()
     assert "ament_python_install_package" in cmake
+    assert "PACKAGE_DIR src/${PROJECT_NAME}" in cmake
     assert "scripts/inspire_hand_teleop" in cmake
     assert "scripts/inspire_hand_command" in cmake
     assert "scripts/video_file_image_publisher" in cmake
